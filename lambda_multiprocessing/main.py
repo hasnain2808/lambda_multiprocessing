@@ -1,12 +1,14 @@
 from multiprocessing import TimeoutError, Process, Pipe
 from multiprocessing.connection import Connection
-from typing import Any, Iterable, List, Dict, Tuple, Union
+from typing import Any, List, Dict, Tuple, Union
 from uuid import uuid4, UUID
 import random
 import os
 from time import time
+import logging
+import traceback
 
-class Child:
+class Worker:
     proc: Process
 
     # this is the number of items that we have sent to the child process
@@ -26,25 +28,18 @@ class Child:
 
     _closed: bool = False
 
-    # if True, do the work in the main process
-    # but present the same interface
-    # and still send stuff through the pipes (to verify they're pickleable)
-    # this is so we can unit test with moto
-    main_proc: bool
 
-    def __init__(self, main_proc=False):
+
+    def __init__(self):
         self.parent_conn, self.child_conn = Pipe(duplex=True)
-        self.main_proc = main_proc
-        if not main_proc:
-            self.proc = Process(target=self.spin)
-            self.proc.start()
-
+        self.proc = Process(target=self.spin)
+        self.proc.start()
     # each child process runs in this
     # a while loop waiting for payloads from the self.child_conn
-    # [(id, func, args, kwds), None] -> call func(args, *kwds)
+    # [(id, args, kwds), None] -> call action(args, *kwds)
     #                         and send the return back through the self.child_conn pipe
-    #                         {id: (ret, None)} if func returned ret
-    #                         {id: (None, err)} if func raised exception err
+    #                         {id: (ret, None)} if action returned ret
+    #                         {id: (None, err)} if action raised exception err
     # [None, True] -> exit gracefully (write nothing to the pipe)
     def spin(self) -> None:
         while True:
@@ -52,31 +47,28 @@ class Child:
             if quit_signal:
                 break
             else:
-                (id, func, args, kwds) = job
-                result = self._do_work(id, func, args, kwds)
+                (id, args, kwds) = job
+                result = self._do_work(id, args, kwds)
                 self.child_conn.send(result)
         self.child_conn.close()
 
-    def _do_work(self, id, func, args, kwds) -> Union[Tuple[Any, None], Tuple[None, Exception]]:
+    def _do_work(self, id, args, kwds) -> Union[Tuple[Any, None], Tuple[None, Exception]]:
         try:
-            ret = {id: (func(*args, **kwds), None)}
+            ret = {id: (self.action(*args, **kwds), None)}
         except Exception as e:
+            print(f'\n\nMultiprocessing failed with error \n{traceback.format_exc()}\n\n')
             # how to handle KeyboardInterrupt?
             ret = {id: (None, e)}
         assert isinstance(list(ret.keys())[0], UUID)
         return ret
 
-    def submit(self, func, args=(), kwds=None) -> 'AsyncResult':
+    def submit(self, args=(), kwds=None) -> 'AsyncResult':
         if self._closed:
             raise ValueError("Cannot submit tasks after closure")
         if kwds is None:
             kwds = {}
         id = uuid4()
-        self.parent_conn.send([(id, func, args, kwds), None])
-        if self.main_proc:
-            self.child_conn.recv()
-            ret = self._do_work(id, func, args, kwds)
-            self.child_conn.send(ret)
+        self.parent_conn.send([(id, args, kwds), None])
         self.queue_sz += 1
         return AsyncResult(id=id, child=self)
 
@@ -95,13 +87,8 @@ class Child:
     # should be idempotent
     def close(self):
         if not self._closed:
-            if not self.main_proc:
-                # send quit signal to child
-                self.parent_conn.send([None, True])
-            else:
-                # no child process to close
-                self.flush()
-                self.child_conn.close()
+            # send quit signal to child
+            self.parent_conn.send([None, True])
 
             # keep track of closure,
             # so subsequent task submissions are rejected
@@ -112,36 +99,34 @@ class Child:
     # should be idempotent
     def join(self):
         assert self._closed, "Must close before joining"
-        if not self.main_proc:
-            try:
-                self.proc.join()
-            except ValueError as e:
-                # .join() has probably been called multiple times
-                # so the process has already been closed
-                pass
-            finally:
-                self.proc.close()
+
+        try:
+            self.proc.join()
+        except ValueError as e:
+            # .join() has probably been called multiple times
+            # so the process has already been closed
+            pass
+        finally:
+            self.proc.close()
 
         self.flush()
         self.parent_conn.close()
 
-
     # terminate child processes without waiting for them to finish
     # should be idempotent
     def terminate(self):
-        if not self.main_proc:
-            try:
-                a = self.proc.is_alive()
-            except ValueError:
-                # already closed
-                # .is_alive seems to raise ValueError not return False if dead
-                pass
-            else:
-                if a:
-                    try:
-                        self.proc.close()
-                    except ValueError:
-                        self.proc.terminate()
+        try:
+            a = self.proc.is_alive()
+        except ValueError:
+            # already closed
+            # .is_alive seems to raise ValueError not return False if dead
+            pass
+        else:
+            if a:
+                try:
+                    self.proc.close()
+                except ValueError:
+                    self.proc.terminate()
         self.parent_conn.close()
         self.child_conn.close()
         self._closed |= True
@@ -149,9 +134,12 @@ class Child:
     def __del__(self):
         self.terminate()
 
+    def action(self, payload):
+        raise NotImplementedError("Implement this method in the subclass")
+
 
 class AsyncResult:
-    def __init__(self, id: UUID, child: Child):
+    def __init__(self, id: UUID, child: Worker):
         assert isinstance(id, UUID)
         self.id = id
         self.child = child
@@ -161,7 +149,7 @@ class AsyncResult:
     # move it into self.result
     def _load(self):
         self.result = self.child.result_cache[self.id]
-        del self.child.result_cache[self.id] # prevent memory leak
+        del self.child.result_cache[self.id]  # prevent memory leak
 
     # Return the result when it arrives.
     # If timeout is not None and the result does not arrive within timeout seconds
@@ -169,8 +157,8 @@ class AsyncResult:
     # If the remote call raised an exception then that exception will be reraised by get().
     # .get() must remember the result
     # and return it again multiple times
-    # delete it from the Child.result_cache to avoid memory leak
-    def get(self, timeout=None):
+    # delete it from the Worker.result_cache to avoid memory leak
+    def get(self, timeout=10):
         if self.result is not None:
             (response, ex) = self.result
             if ex:
@@ -188,14 +176,14 @@ class AsyncResult:
                 return self.get(0)
 
     # Wait until the result is available or until timeout seconds pass.
-    def wait(self, timeout=None):
+    def wait(self, timeout=10):
         start_t = time()
         if self.result is None:
             self.child.flush()
             # the result we want might not be the next result
             # it might be the 2nd or 3rd next
             while (self.id not in self.child.result_cache) and \
-                  ((timeout is None) or (time() - timeout < start_t)):
+                    ((timeout is None) or (time() - timeout < start_t)):
                 if timeout is None:
                     self.child.parent_conn.poll()
                 else:
@@ -221,38 +209,23 @@ class AsyncResult:
 
         return self.result[1] is None
 
+
 class Pool:
-    def __init__(self, processes=None, initializer=None, initargs=None, maxtasksperchild=None, context=None):
+    def __init__(self, processes=None, worker=Worker):
         if processes is None:
-            self.num_processes = os.cpu_count()
+            self.num_processes = max(os.cpu_count(), 2)
         else:
             if processes < 0:
                 raise ValueError("processes must be a positive integer")
-            self.num_processes = processes
-
-
-        if initializer:
-            raise NotImplementedError("initializer not implemented")
-
-        if initargs:
-            raise NotImplementedError("initargs not implemented")
-
-        if maxtasksperchild:
-            raise NotImplementedError("maxtasksperchild not implemented")
-
-        if context:
-            raise NotImplementedError("context not implemented")
+            self.num_processes = max(processes, 2)
 
         self._closed = False
+        self.Worker = worker
 
     def __enter__(self):
         self._closed = False
 
-        if self.num_processes > 0:
-            self.children = [Child() for _ in range(self.num_processes)]
-        else:
-            # create one 'child' which will just do work in the main thread
-            self.children = [Child(main_proc=True)]
+        self.children = [self.Worker() for _ in range(self.num_processes)]
 
         return self
 
@@ -284,15 +257,11 @@ class Pool:
             c.terminate()
         self._closed |= True
 
-    def apply(self, func, args=(), kwds=None):
-        ret = self.apply_async(func, args, kwds)
+    def apply(self, args=(), kwds=None):
+        ret = self.apply_async(args, kwds)
         return ret.get()
 
-    def apply_async(self, func, args=(), kwds=None, callback=None, error_callback=None) -> AsyncResult:
-        if callback:
-            raise NotImplementedError("callback not implemented")
-        if error_callback:
-            raise NotImplementedError("error_callback not implemented")
+    def apply_async(self, args=(), kwds=None) -> AsyncResult:
 
         if self._closed:
             raise ValueError("Pool already closed")
@@ -306,27 +275,20 @@ class Pool:
             c.flush()
         min_q_sz = min(c.queue_sz for c in self.children)
         c = random.choice([c for c in self.children if c.queue_sz <= min_q_sz])
-        return c.submit(func, args, kwds)
+        return c.submit(args, kwds)
 
-    def map_async(self, func, iterable, chunksize=None, callback=None, error_callback=None) -> List[AsyncResult]:
-        return self.starmap_async(func, zip(iterable), chunksize, callback, error_callback)
-
-    def map(self, func, iterable, chunksize=None, callback=None, error_callback=None) -> List:
-        return self.starmap(func, zip(iterable), chunksize, callback, error_callback)
-
-    def starmap_async(self, func, iterable: Iterable[Iterable], chunksize=None, callback=None, error_callback=None) -> List[AsyncResult]:
-        if chunksize:
-            raise NotImplementedError("Haven't implemented chunksizes. Infinite chunksize only.")
-        if callback or error_callback:
-            raise NotImplementedError("Haven't implemented callbacks")
-        return [self.apply_async(func, args) for args in iterable]
-
-    def starmap(self, func, iterable: Iterable[Iterable], chunksize=None, callback=None, error_callback=None) -> List[Any]:
-        results = self.starmap_async(func, iterable, chunksize, callback, error_callback)
+    def schedule(self, iterable) -> List:
+        results = [self.apply_async(args) for args in zip(iterable)]
         return [r.get() for r in results]
 
-    def imap(self, func, iterable, chunksize=None):
-        raise NotImplementedError("Only normal apply, map, starmap and their async equivilents have been implemented")
+# example usage
 
-    def imap_unordered(self, func, iterable, chunksize=None):
-        raise NotImplementedError("Only normal apply, map, starmap and their async equivilents have been implemented")
+# with Pool(processes = 8, worker=ValidatorWorker) as p:
+#     payload = p.schedule(payload)\
+
+#
+# class ValidatorWorker(Worker):
+#
+#     def action(self, x):
+#
+#         return x*x

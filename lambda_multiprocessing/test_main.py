@@ -1,6 +1,6 @@
 import unittest
 import multiprocessing
-from lambda_multiprocessing import Pool, TimeoutError, AsyncResult
+from lambda_multiprocessing import Pool, TimeoutError, AsyncResult, Worker
 from time import time, sleep
 from typing import Tuple
 from pathlib import Path
@@ -13,7 +13,6 @@ from moto import mock_s3
 # if other processes are hogging CPU, make this bigger
 delta = 0.1
 
-# some simple functions to run inside the child process
 def square(x):
     return x*x
 
@@ -28,6 +27,36 @@ def divide(a, b):
 
 def return_args_kwargs(*args, **kwargs):
     return {'args': args, 'kwargs': kwargs}
+
+# some simple functions to run inside the child process
+class SquareWorker(Worker):
+    def action(self, x):
+        return x*x
+class FailWorker(Worker):
+    def action(self, x):
+        assert False, "deliberate fail"
+class SumTwoWorker(Worker):
+    def action(self, a, b):
+        return a + b
+class DivideWorker(Worker):
+    def action(self, a, b):
+        return a / b
+
+class ReturnArgsKwargsWorker(Worker):
+    def action(self, *args, **kwargs):
+        return {'args': args, 'kwargs': kwargs}
+
+class SleepWorker(Worker):
+    def action(self, x):
+        return sleep(x)
+
+class UploadWorker(Worker):
+    def action(self, args: Tuple[str, str, bytes]):
+        (bucket_name, key, data) = args
+        client = boto3.client('s3')
+        client.put_object(Bucket=bucket_name, Key=key, Body=data)
+        sleep(1)
+        return client.get_object(Bucket=bucket_name, Key=key)['Body'].read()
 
 class TestStdLib(unittest.TestCase):
     @unittest.skip('Need to set up to remove /dev/shm')
@@ -81,20 +110,20 @@ class TestApply(TestCase):
 
     def test_simple(self):
         args = range(5)
-        with Pool() as p:
-            actual = [p.apply(square, (x,)) for x in args]
+        with Pool(worker=SquareWorker) as p:
+            actual = [p.apply((x,)) for x in args]
         with multiprocessing.Pool() as p:
             expected = [p.apply(square, (x,)) for x in args]
         self.assertEqual(actual, expected)
 
     def test_two_args(self):
-        with Pool() as p:
-            actual = p.apply(sum_two, (3, 4))
+        with Pool(worker=SumTwoWorker) as p:
+            actual = p.apply(args = (3, 4))
             self.assertEqual(actual, sum_two(3, 4))
 
     def test_kwargs(self):
-        with Pool() as p:
-            actual = p.apply(return_args_kwargs, (1, 2), {'x': 'X', 'y': 'Y'})
+        with Pool(worker=ReturnArgsKwargsWorker) as p:
+            actual = p.apply((1, 2), {'x': 'X', 'y': 'Y'})
             expected = {
                 'args': (1,2),
                 'kwargs': {
@@ -107,27 +136,27 @@ class TestApply(TestCase):
 class TestApplyAsync(TestCase):
 
     def test_result(self):
-        with Pool() as p:
-            r = p.apply_async(square, (2,))
+        with Pool(worker=SquareWorker) as p:
+            r = p.apply_async((2,))
             result = r.get(2)
             self.assertEqual(result, square(2))
 
     def test_twice(self):
         args = range(5)
         # now try twice with the same pool
-        with Pool() as p:
-            ret = [p.apply_async(square, (x,)) for x in args]
-            ret.extend(p.apply_async(square, (x,)) for x in args)
+        with Pool(worker=SquareWorker) as p:
+            ret = [p.apply_async((x,)) for x in args]
+            ret.extend(p.apply_async((x,)) for x in args)
 
         self.assertEqual([square(x) for x in args] * 2, [square(x) for x in args] * 2)
 
     def test_time(self):
         # test the timing to confirm it's in parallel
         n = 4
-        with Pool(n) as p:
+        with Pool(n, worker=SleepWorker) as p:
             with self.assertDuration(min_t=n-1, max_t=(n-1)+delta):
                 with self.assertDuration(max_t=1):
-                    ret = [p.apply_async(sleep, (r,)) for r in range(n)]
+                    ret = [p.apply_async((r,)) for r in range(n)]
                 ret = [r.get(n*2) for r in ret]
 
     @unittest.skip("Standard library doesn't handle this well, unsure whether to do the same or not")
@@ -162,39 +191,40 @@ class TestApplyAsync(TestCase):
 
     def test_get_not_ready_a(self):
         t = 2
-        with Pool() as p:
-            r = p.apply_async(sleep, (t,))
+        with Pool(worker=SleepWorker) as p:
+            r = p.apply_async((t,))
             with self.assertRaises(multiprocessing.TimeoutError):
                 r.get(t-1) # result not ready get
 
     def test_get_not_ready_b(self):
         t = 2
-        with Pool() as p:
+        with Pool(worker=SleepWorker) as p:
             # check same exception exists from main
-            r = p.apply_async(sleep, (t,))
+            r = p.apply_async((t,))
             with self.assertRaises(TimeoutError):
                 r.get(t-1)
 
     def test_get_not_ready_c(self):
         t = 2
-        with Pool() as p:
-            r = p.apply_async(sleep, (t,))
+        with Pool(worker=SleepWorker) as p:
+            r = p.apply_async((t,))
             sleep(1)
             self.assertFalse(r.ready())
             sleep(t)
             self.assertTrue(r.ready())
 
     def test_wait(self):
-        with Pool() as p:
-            r = p.apply_async(square, (1,))
+        with Pool(worker=SquareWorker) as p:
+            r = p.apply_async((1,))
             with self.assertDuration(max_t=delta):
                 r.wait()
             self.assertTrue(r.ready())
             ret = r.get(0)
             self.assertEqual(ret, square(1))
 
+        with Pool(worker=SleepWorker) as p:
             # now check when not ready
-            r = p.apply_async(sleep, (5,))
+            r = p.apply_async((5,))
             self.assertFalse(r.ready())
             with self.assertDuration(min_t=2, max_t=2.1):
                 r.wait(2)
@@ -202,45 +232,46 @@ class TestApplyAsync(TestCase):
 
             # now check with a wait longer than the task
             with self.assertDuration(min_t=1, max_t=1.1):
-                r = p.apply_async(sleep, (1,))
+                r = p.apply_async((1,))
                 self.assertFalse(r.ready())
                 r.wait(2)
             self.assertTrue(r.ready())
             ret = r.get(0)
 
     def test_get_twice(self):
-        with Pool() as p:
-            r = p.apply_async(square, (2,))
+        with Pool(worker=SquareWorker) as p:
+            r = p.apply_async((2,))
             self.assertEqual(r.get(), square(2))
             self.assertEqual(r.get(), square(2))
 
     def test_successful(self):
-        with Pool() as p:
-            r = p.apply_async(square, (1,))
+        with Pool(worker=SquareWorker) as p:
+            r = p.apply_async((1,))
             sleep(delta)
             self.assertTrue(r.successful())
 
-            r = p.apply_async(sleep, (1,))
+        with Pool(worker=SleepWorker) as p:
+            r = p.apply_async((1,))
             with self.assertRaises(ValueError):
                 r.successful()
 
             sleep(1.2)
             self.assertTrue(r.successful())
 
-
-            r = p.apply_async(fail, (1,))
+        with Pool(worker=FailWorker) as p:
+            r = p.apply_async((1,))
             sleep(delta)
             self.assertFalse(r.successful())
 
     def test_two_args(self):
-        with Pool() as p:
-            ret = p.apply_async(sum_two, (1, 2))
+        with Pool(worker=SumTwoWorker) as p:
+            ret = p.apply_async((1, 2))
             ret.wait()
             self.assertEqual(ret.get(), sum_two(1,2))
 
     def test_kwargs(self):
-        with Pool() as p:
-            actual = p.apply_async(return_args_kwargs, (1, 2), {'x': 'X', 'y': 'Y'}).get()
+        with Pool(worker=ReturnArgsKwargsWorker) as p:
+            actual = p.apply_async((1, 2), {'x': 'X', 'y': 'Y'}).get()
             expected = {
                 'args': (1,2),
                 'kwargs': {
@@ -252,15 +283,15 @@ class TestApplyAsync(TestCase):
 
     def test_error_handling(self):
         with self.assertRaises(AssertionError):
-            with Pool() as p:
-                r = p.apply_async(fail, (1,))
+            with Pool(worker=FailWorker) as p:
+                r = p.apply_async((1,))
                 r.get()
 
-class TestMap(TestCase):
+class TestSchedule(TestCase):
     def test_simple(self):
         args = range(5)
-        with Pool() as p:
-            actual = p.map(square, args)
+        with Pool(worker=SquareWorker) as p:
+            actual = p.schedule(args)
         self.assertIsInstance(actual, list)
         expected = [square(x) for x in args]
         self.assertEqual(expected, actual)
@@ -268,83 +299,27 @@ class TestMap(TestCase):
 
     def test_duration(self):
         n = 2
-        with Pool(n) as p:
+        with Pool(n, worker=SleepWorker) as p:
             with self.assertDuration(min_t=(n-1)-delta, max_t=(n+1)+delta):
-                p.map(sleep, range(n))
+                p.schedule(range(n))
 
     def test_error_handling(self):
-        with Pool() as p:
+        with Pool(worker=FailWorker) as p:
             with self.assertRaises(AssertionError):
-                p.map(fail, range(2))
+                p.schedule(range(2))
 
     @unittest.skip('Need to implement chunking to fix this')
     def test_long_iter(self):
-        with Pool() as p:
-            p.map(square, range(10**3))
-
-class TestMapAsync(TestCase):
-    def test_simple(self):
-        args = range(5)
-        with Pool() as p:
-            actual = p.map_async(square, args)
-            self.assertIsInstance(actual, list)
-            for x in actual:
-                self.assertIsInstance(x, AsyncResult)
-
-            results = [a.get() for a in actual]
-        self.assertEqual(results, [square(e) for e in args])
-
-    def test_duration(self):
-        n = 2
-        with Pool(n) as p:
-            with self.assertDuration(min_t=(n-1)-delta, max_t=(n+1)+delta):
-                with self.assertDuration(max_t=delta):
-                    results = p.map_async(sleep, range(n))
-                [r.get() for r in results]
-
-    def test_error_handling(self):
-        with Pool() as p:
-            r = p.map_async(fail, range(2))
-            with self.assertRaises(AssertionError):
-                [x.get(1) for x in r]
-
-class TestStarmap(TestCase):
-    def test(self):
-        with Pool() as p:
-            actual = p.starmap(sum_two, [(1,2), (3,4)])
-        expected = [(1+2), (3+4)]
-        self.assertEqual(actual, expected)
-
-    def test_error_handling(self):
-        with Pool() as p:
-            with self.assertRaises(ZeroDivisionError):
-                p.starmap(divide, [(1,2), (3,0)])
-
-
-
-class TestStarmapAsync(TestCase):
-    def test(self):
-        with Pool() as p:
-            actual = p.starmap_async(sum_two, [(1,2), (3,4)])
-            self.assertIsInstance(actual, list)
-            actual = [r.get() for r in actual]
-        expected = [(1+2), (3+4)]
-        self.assertEqual(actual, expected)
-
-    def test_error_handling(self):
-        with Pool() as p:
-            results = p.starmap_async(divide, [(1,2), (3,0)])
-            with self.assertRaises(ZeroDivisionError):
-                [r.get() for r in results]
-
+        with Pool(worker=SquareWorker) as p:
+            p.schedule(range(10**3))
 
 class TestTidyUp(TestCase):
     # test that the implicit __exit__
     # waits for child process to finish
     def test_exit(self):
         t = 1
-        with Pool() as p:
-            r = p.apply_async(sleep, (t,))
+        with Pool(worker=SleepWorker) as p:
+            r = p.apply_async((t,))
             t1 = time()
         t2 = time()
         self.assertLessEqual(abs((t2-t1)-t), delta)
@@ -354,8 +329,8 @@ class TestTidyUp(TestCase):
     # nor wait for them to finish
     def test_close(self):
         t = 1
-        with Pool() as p:
-            r = p.apply_async(sleep, (t,))
+        with Pool(worker=SleepWorker) as p:
+            r = p.apply_async((t,))
             with self.assertDuration(max_t=delta):
                 p.close()
             with self.assertDuration(min_t=t-delta, max_t=t+delta):
@@ -363,43 +338,31 @@ class TestTidyUp(TestCase):
             pass # makes traceback from __exit__ clearer
 
     def test_submit_after_close(self):
-        with Pool() as p:
+        with Pool(worker=SquareWorker) as p:
             p.close()
             with self.assertRaises(ValueError):
-                p.apply_async(square, (1,))
+                p.apply_async((1,))
 
     # test that .terminate does not
     # wait for child process to finish
     def test_terminate(self):
         with self.assertDuration(max_t=delta):
-            with Pool() as p:
-                r = p.apply_async(sleep, (1,))
+            with Pool(worker=SleepWorker) as p:
+                r = p.apply_async((1,))
                 t1 = time()
                 p.terminate()
                 t2 = time()
                 self.assertLessEqual(t2-t1, delta)
 
     def test_submit_after_terminate(self):
-        with Pool() as p:
+        with Pool(worker=SquareWorker) as p:
             p.terminate()
             with self.assertRaises(ValueError):
-                p.apply_async(square, (1,))
+                p.apply_async((1,))
 
-
-# must be a global method to be pickleable
-def upload(args: Tuple[str, str, bytes]):
-    (bucket_name, key, data) = args
-    client = boto3.client('s3')
-    client.put_object(Bucket=bucket_name, Key=key, Body=data)
 
 
 class TestMoto(TestCase):
-    def test_main_proc(self):
-        t = 1
-        with Pool(0) as p:
-            with self.assertDuration(min_t=t-delta, max_t=t+delta):
-                r = p.apply_async(sleep, (t,))
-                pass # makes traceback from __exit__ easier to read
 
     @mock_s3
     def test_moto(self):
@@ -419,25 +382,18 @@ class TestMoto(TestCase):
         # so the function should execute correctly
         # but it will upload an object to mocked S3 in the child process
         # so that file won't exist in the parent process
-        with Pool() as p:
-            p.apply(upload, ((bucket_name,key, data),))
-        with self.assertRaises(client.exceptions.NoSuchKey):
-            client.get_object(Bucket=bucket_name, Key=key)['Body'].read()
-
-        # now try again with 0 processes
-        with Pool(0) as p:
-            p.apply(upload, ((bucket_name,key, data),))
-
-        ret = client.get_object(Bucket=bucket_name, Key=key)['Body'].read()
+        with Pool(worker=UploadWorker) as p:
+            ret = p.apply(((bucket_name,key, data),))
+        print(ret)
         self.assertEqual(ret, data)
 
 class TestSlow(TestCase):
     @unittest.skip('Very slow')
     def test_memory_leak(self):
         for i in range(10**2):
-            with Pool() as p:
+            with Pool(worker=SquareWorker) as p:
                 for j in range(10**2):
-                    p.map(square, range(10**3))
+                    p.map(range(10**3))
 
 if __name__ == '__main__':
     unittest.main()
